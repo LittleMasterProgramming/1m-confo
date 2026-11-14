@@ -28,7 +28,9 @@
 window.CONFO_CONFIG = {
   /* 1) Firebase login: paste the values from Firebase Console → Project settings → Your apps → Web app.
         Leave apiKey empty to keep the simple local sign-in. */
-  firebase: { apiKey: "AIzaSyBcdQBvy_7I89a1y4TjtG3MQ8AAWGnrarI", authDomain: "m-ltd---confo.firebaseapp.com", projectId: "m-ltd---confo", appId: "1:351409983631:web:cbc922baa7aa1dd098a0fa" },
+  firebase: { apiKey: "AIzaSyBcdQBvy_7I89a1y4TjtG3MQ8AAWGnrarI", authDomain: "m-ltd---confo.firebaseapp.com", projectId: "m-ltd---confo", appId: "1:351409983631:web:cbc922baa7aa1dd098a0fa", databaseURL: "https://m-ltd---confo-default-rtdb.firebaseio.com" },
+
+  /* 1b) databaseURL = the address on the Realtime Database page (Build → Realtime Database). This is what makes everyone join the SAME room. */
 
   /* 2) Optional: only these emails may sign in (e.g. your students). Empty list = everyone. */
   allowedEmails: [],
@@ -1155,12 +1157,115 @@ function __hubAttach(ws) {
     }, Math.random() * 150);
   }
 
+  /* ---------- Firebase shared loader + Realtime Database transport (most reliable) ---------- */
+  var fbP = null;
+  function fb() {
+    if (fbP) return fbP;
+    var F = (window.CONFO_CONFIG || {}).firebase || {};
+    if (!F.apiKey || !F.projectId) return (fbP = Promise.resolve(null));
+    var base = 'https://www.gstatic.com/firebasejs/10.12.5/';
+    function load(src) { return new Promise(function (res, rej) { var s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
+    var seq = load(base + 'firebase-app-compat.js').then(function () { return load(base + 'firebase-auth-compat.js'); });
+    if (F.databaseURL) seq = seq.then(function () { return load(base + 'firebase-database-compat.js'); });
+    fbP = seq.then(function () {
+      var cfg = { apiKey: F.apiKey, authDomain: F.authDomain, projectId: F.projectId, appId: F.appId };
+      if (F.databaseURL) cfg.databaseURL = F.databaseURL;
+      firebase.initializeApp(cfg);
+      return firebase;
+    }).catch(function () { return null; });
+    return fbP;
+  }
+  fb();
+  var dbWarned = false;
+
+  function tryRTDB(sock, room) {
+    var F = (window.CONFO_CONFIG || {}).firebase || {};
+    if (!F.databaseURL) return Promise.resolve(false);
+    return fb().then(function (f) {
+      if (!f || !f.database) return false;
+      return new Promise(function (resolve) {
+        var settled = false;
+        function fin(v) { if (!settled) { settled = true; resolve(v); } }
+        function fail(e) { if (!dbWarned) { dbWarned = true; toast('Realtime Database not reachable — check the database URL and rules'); } fin(false); }
+        var to = setTimeout(fail, 9000);
+        var db = f.database();
+        var base = db.ref('confo/rooms/' + room.toLowerCase().replace(/[^a-z0-9_-]/g, '-'));
+        var cid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        var hubRef = base.child('hub');
+
+        function runHub() {
+          clearTimeout(to);
+          hubRef.onDisconnect().remove();
+          base.child('up').remove(); base.child('presence').remove();
+          restoreRoom(room);
+          var srvs = {};
+          hubs[room] = { close: function () { try { hubRef.remove(); base.child('up').off(); base.child('presence').off(); } catch (e) {} } };
+          base.child('up').on('child_added', function (s) {
+            var m = s.val(); s.ref.remove(); if (!m || !m.cid) return;
+            var down = base.child('down/' + m.cid);
+            if (m.t === 'open') {
+              if (!srvs[m.cid]) srvs[m.cid] = makeServerSide(function (d) { down.push({ d: d }); });
+              down.push({ d: '__hello' });
+            } else if (m.t === 'msg' && srvs[m.cid]) srvs[m.cid]._recv(m.d);
+            else if (m.t === 'bye' && srvs[m.cid]) { srvs[m.cid]._end(); delete srvs[m.cid]; down.remove(); }
+          });
+          base.child('presence').on('child_removed', function (s) {
+            var id = s.key;
+            if (srvs[id]) { srvs[id]._end(); delete srvs[id]; base.child('down/' + id).remove(); }
+          });
+          window.addEventListener('pagehide', function () { try { hubRef.remove(); } catch (e) {} });
+          sock._ready(localLink(sock));
+          fin(true);
+        }
+
+        function runClient(hubCid) {
+          var down = base.child('down/' + cid), pres = base.child('presence/' + cid), ready = false;
+          pres.set(true); pres.onDisconnect().remove();
+          down.remove();
+          var hello = setTimeout(function () {
+            /* hub looks dead: try to take over */
+            down.off();
+            hubRef.transaction(function (cur) { return (cur && cur.cid === hubCid) ? { cid: cid, t: Date.now() } : undefined; }).then(function (r) {
+              if (r.committed) runHub(); else { clearTimeout(to); sock._lost(); fin(true); }
+            }).catch(function () { clearTimeout(to); sock._lost(); fin(true); });
+          }, 6000);
+          down.on('child_added', function (s) {
+            var m = s.val(); s.ref.remove(); if (!m) return;
+            if (m.d === '__hello') {
+              if (ready) return; ready = true; clearTimeout(hello); clearTimeout(to);
+              sock._ready({
+                send: function (d) { base.child('up').push({ cid: cid, t: 'msg', d: d }); },
+                close: function () { try { base.child('up').push({ cid: cid, t: 'bye' }); down.off(); hubRef.off(); pres.remove(); } catch (e) {} }
+              });
+              hubRef.on('value', function (v) { var h = v.val(); if (ready && (!h || h.cid !== hubCid)) { ready = false; hubRef.off(); sock._lost(); } });
+              fin(true);
+              return;
+            }
+            sock._deliver(m.d);
+          });
+          base.child('up').push({ cid: cid, t: 'open' });
+        }
+
+        hubRef.once('value').then(function (s) {
+          var cur = s.val();
+          if (!cur) {
+            return hubRef.transaction(function (c) { return c ? undefined : { cid: cid, t: Date.now() }; }).then(function (r) {
+              if (r.committed) return runHub();
+              return hubRef.once('value').then(function (s2) { var c2 = s2.val(); if (c2) runClient(c2.cid); else fail(); });
+            });
+          }
+          runClient(cur.cid);
+        }).catch(fail);
+      });
+    });
+  }
+
   var warned = false;
   function connect(sock, room, n) {
     n = n || 0;
     if (hubs[room]) return sock._ready(localLink(sock));
     if (navigator.onLine === false) { toast('You are offline — room works across tabs on this device only'); return tryBC(sock, room); }
-    tryPeer(sock, room).then(function (ok) {
+    tryRTDB(sock, room).then(function (ok) { return ok ? true : tryPeer(sock, room); }).then(function (ok) {
       if (ok) return;
       if (n < 2) { if (n === 0) toast('Connecting to the meeting server… please wait'); return setTimeout(function () { if (sock.readyState === 1) connect(sock, room, n + 1); }, 1500); }
       if (!warned) { warned = true; toast('Meeting server unreachable — others cannot join until your internet connection works. Local mode only.'); }
@@ -1356,14 +1461,12 @@ function __hubAttach(ws) {
       if (t && !auth.currentUser) { e.stopImmediatePropagation(); e.preventDefault(); toast('Please sign in to join the meeting'); var o = $('btn-open-login'); if (o) o.click(); }
     }, true);
 
-    function load(src) { return new Promise(function (res, rej) { var s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
-    var base = 'https://www.gstatic.com/firebasejs/10.12.5/';
-    load(base + 'firebase-app-compat.js').then(function () { return load(base + 'firebase-auth-compat.js'); }).then(function () {
-      firebase.initializeApp({ apiKey: F.apiKey, authDomain: F.authDomain, projectId: F.projectId, appId: F.appId });
-      auth = firebase.auth();
+    fb().then(function (f) {
+      if (!f) return toast('Could not load sign-in service. Check your internet connection.');
+      auth = f.auth();
       var first = true;
       auth.onAuthStateChanged(function (u) { if (u && first && !applying) done(u); first = false; });
-    }).catch(function () { toast('Could not load sign-in service. Check your internet connection.'); });
+    });
   });
 
 })();
