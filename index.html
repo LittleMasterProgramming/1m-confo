@@ -38,6 +38,10 @@ window.CONFO_CONFIG = {
   /* 3) true = people must be signed in before they can join a meeting */
   requireLogin: false,
 
+  /* 3b) Optional: Google Sheets attendance. Paste your Google Apps Script web-app URL here (see instructions).
+        Every join/leave is then added to your sheet live. */
+  sheetsWebhook: "",
+
   /* 4) Optional but recommended: your own TURN server so video works on every network.
         Example: [{ urls: "turn:YOUR-HOST:443", username: "USER", credential: "PASS" }] */
   turn: []
@@ -85,6 +89,25 @@ function getOrCreateRoom(roomId) {
     }
     return rooms.get(roomId);
 }
+function logAtt(room, peerId, name, role, evt, email) {
+    room.attendance = room.attendance || [];
+    const now = Date.now();
+    if (evt === 'join') {
+        room.attendance.push({ peerId, name: name || 'Guest', email: email || '', role: role || 'participant', joinedAt: now, leftAt: null });
+    }
+    else {
+        for (let i = room.attendance.length - 1; i >= 0; i--) {
+            const a = room.attendance[i];
+            if (a.peerId === peerId && !a.leftAt) {
+                a.leftAt = now;
+                break;
+            }
+        }
+    }
+    const msg = JSON.stringify({ type: 'attendance-updated', attendance: room.attendance, event: evt, entry: { peerId, name: name || 'Guest', email: email || '', role: role || 'participant', time: now }, poster: (Array.from(room.peers.values()).find((p) => p.role === 'host') || {}).peerId });
+    room.peers.forEach((p) => { if ((p.role === 'host' || p.role === 'co-host') && p.ws.readyState === 1)
+        p.ws.send(msg); });
+}
 function __hubAttach(ws) {
     let currentRoomId = null;
     let currentPeerId = null;
@@ -95,14 +118,14 @@ function __hubAttach(ws) {
             const { type } = data;
             // Join Room
             if (type === 'join-room') {
-                const { roomId, peerId, name, isMuted, isVideoOff } = data;
+                const { roomId, peerId, name, isMuted, isVideoOff, email } = data;
                 currentRoomId = roomId;
                 currentPeerId = peerId;
                 const room = getOrCreateRoom(roomId);
                 const isFirstPeer = room.peers.size === 0;
                 const assignedRole = isFirstPeer ? 'host' : 'participant';
                 // Check if room is locked by host
-                if (room.roomLocked && !isFirstPeer) {
+                if (room.roomLocked && !isFirstPeer && !(room.graceUntil && Date.now() < room.graceUntil)) {
                     ws.send(JSON.stringify({
                         type: 'room-locked-denied',
                         message: 'This meeting room is currently locked by the host.',
@@ -110,8 +133,8 @@ function __hubAttach(ws) {
                     return;
                 }
                 // Check if waiting room is active and this user is not the host
-                if (room.waitingRoomEnabled && !isFirstPeer) {
-                    room.waitingPeers.set(peerId, { ws, peerId, name: name || 'Guest' });
+                if (room.waitingRoomEnabled && !isFirstPeer && !(room.graceUntil && Date.now() < room.graceUntil)) {
+                    room.waitingPeers.set(peerId, { ws, peerId, name: name || 'Guest', email: email || '' });
                     ws.send(JSON.stringify({
                         type: 'in-waiting-room',
                         message: 'The host has been notified. You will join once admitted.',
@@ -143,6 +166,7 @@ function __hubAttach(ws) {
                     isHandRaised: false,
                     isScreenSharing: false,
                 });
+                logAtt(room, peerId, name || 'Guest', assignedRole, 'join', email);
                 // Compile existing peers list
                 const existingPeersList = Array.from(room.peers.values())
                     .filter((p) => p.peerId !== peerId)
@@ -167,6 +191,8 @@ function __hubAttach(ws) {
                     notes: room.notes,
                     chatHistory: room.chatHistory.filter((c) => !c.isPrivate || c.peerId === peerId || c.recipientPeerId === peerId),
                     activePoll: room.activePoll || null,
+                    pollHistory: room.pollHistory || [],
+                    attendance: room.attendance || [],
                     allowSelfUnmute: room.allowSelfUnmute !== false,
                     qaItems: room.qaItems || [],
                     meetingTimerEnd: room.meetingTimerEnd || null,
@@ -226,6 +252,7 @@ function __hubAttach(ws) {
                         isHandRaised: p.isHandRaised,
                         isScreenSharing: p.isScreenSharing,
                     }));
+                    logAtt(room, targetPeerId, waiting.name, 'participant', 'join', waiting.email);
                     waiting.ws.send(JSON.stringify({
                         type: 'room-joined',
                         roomId: currentRoomId,
@@ -237,6 +264,8 @@ function __hubAttach(ws) {
                         notes: room.notes,
                         chatHistory: room.chatHistory.filter((c) => !c.isPrivate || c.peerId === targetPeerId || c.recipientPeerId === targetPeerId),
                         activePoll: room.activePoll || null,
+                        pollHistory: room.pollHistory || [],
+                        attendance: room.attendance || [],
                         allowSelfUnmute: room.allowSelfUnmute !== false,
                         qaItems: room.qaItems || [],
                         meetingTimerEnd: room.meetingTimerEnd || null,
@@ -408,6 +437,7 @@ function __hubAttach(ws) {
                                 removedBy: caller.name,
                             }));
                         }
+                        logAtt(room, targetPeerId, target.name, target.role, 'leave');
                         room.peers.delete(targetPeerId);
                         const leaveBroadcast = JSON.stringify({
                             type: 'peer-left',
@@ -633,92 +663,78 @@ function __hubAttach(ws) {
                 });
                 return;
             }
-            // Live Polls: Create Poll
+            // Live Polls (host / co-host launch; every poll is kept in history)
+            const __isMod = () => {
+                const c = room.peers.get(currentPeerId);
+                return !!c && (c.role === 'host' || c.role === 'co-host');
+            };
+            const __sendAll = (payload) => {
+                const s = JSON.stringify(payload);
+                room.peers.forEach((p) => { if (p.ws.readyState === WebSocket.OPEN)
+                    p.ws.send(s); });
+            };
             if (type === 'poll-create') {
-                const rawPoll = data.poll || data;
-                const question = String((rawPoll === null || rawPoll === void 0 ? void 0 : rawPoll.question) || '').trim();
-                const rawOptions = Array.isArray(rawPoll === null || rawPoll === void 0 ? void 0 : rawPoll.options) ? rawPoll.options : [];
-                if (!question || rawOptions.length < 2)
+                if (!__isMod())
                     return;
                 const caller = room.peers.get(currentPeerId);
-                const pollId = (rawPoll === null || rawPoll === void 0 ? void 0 : rawPoll.id) || `poll-${Date.now()}`;
-                const normalizedOptions = rawOptions
+                const rawPoll = data.poll || data;
+                const question = String((rawPoll === null || rawPoll === void 0 ? void 0 : rawPoll.question) || data.question || '').trim();
+                const rawOptions = Array.isArray(rawPoll === null || rawPoll === void 0 ? void 0 : rawPoll.options) ? rawPoll.options : (Array.isArray(data.options) ? data.options : []);
+                if (!question || rawOptions.length < 2)
+                    return;
+                const options = rawOptions
                     .map((opt, idx) => {
                     const text = typeof opt === 'string' ? opt.trim() : String((opt === null || opt === void 0 ? void 0 : opt.text) || '').trim();
-                    const id = typeof opt === 'object' && (opt === null || opt === void 0 ? void 0 : opt.id) ? String(opt.id) : `opt-${idx + 1}`;
-                    return { id, text, votes: 0 };
+                    return { id: `opt-${idx + 1}`, text, votes: 0 };
                 })
                     .filter((o) => o.text.length > 0);
-                if (normalizedOptions.length < 2)
+                if (options.length < 2)
                     return;
+                room.pollHistory = room.pollHistory || [];
+                room.pollHistory.forEach((p) => { p.isActive = false; });
                 const poll = {
-                    id: pollId,
+                    id: (rawPoll === null || rawPoll === void 0 ? void 0 : rawPoll.id) || `poll-${Date.now()}`,
                     question,
-                    options: normalizedOptions,
+                    options,
                     createdBy: currentPeerId,
-                    creatorName: (caller === null || caller === void 0 ? void 0 : caller.name) || 'Presenter',
+                    creatorName: (caller === null || caller === void 0 ? void 0 : caller.name) || 'Host',
+                    createdAt: Date.now(),
                     isActive: true,
                     votedPeerIds: [],
                 };
+                room.pollHistory.push(poll);
                 room.activePoll = poll;
-                const pollBroadcast = JSON.stringify({
-                    type: 'poll-created',
-                    poll,
-                });
-                room.peers.forEach((p) => {
-                    if (p.ws.readyState === WebSocket.OPEN)
-                        p.ws.send(pollBroadcast);
-                });
+                __sendAll({ type: 'poll-created', poll, history: room.pollHistory });
                 return;
             }
-            // Live Polls: Cast Vote
             if (type === 'poll-vote') {
-                const { pollId, optionIndex, optionId } = data;
-                if (room.activePoll && (!pollId || room.activePoll.id === pollId) && room.activePoll.isActive) {
-                    if (!room.activePoll.votedPeerIds.includes(currentPeerId)) {
-                        let targetIdx = typeof optionIndex === 'number' ? optionIndex : -1;
-                        if (targetIdx < 0 && optionId !== undefined) {
-                            targetIdx = room.activePoll.options.findIndex((o, i) => (o.id || `opt-${i + 1}`) === String(optionId));
-                        }
-                        if (targetIdx >= 0 && room.activePoll.options[targetIdx]) {
-                            room.activePoll.options[targetIdx].votes++;
-                            room.activePoll.votedPeerIds.push(currentPeerId);
-                            const voteBroadcast = JSON.stringify({
-                                type: 'poll-updated',
-                                poll: room.activePoll,
-                            });
-                            room.peers.forEach((p) => {
-                                if (p.ws.readyState === WebSocket.OPEN)
-                                    p.ws.send(voteBroadcast);
-                            });
-                        }
-                    }
+                const { pollId, optionIndex } = data;
+                const hist = room.pollHistory || [];
+                const poll = hist.find((p) => p.id === pollId) || room.activePoll;
+                if (poll && poll.isActive && !poll.votedPeerIds.includes(currentPeerId) && poll.options[optionIndex]) {
+                    poll.options[optionIndex].votes++;
+                    poll.votedPeerIds.push(currentPeerId);
+                    __sendAll({ type: 'poll-updated', poll, history: hist });
                 }
                 return;
             }
-            // Live Polls: Close Poll
             if (type === 'poll-close') {
-                if (room.activePoll) {
-                    room.activePoll.isActive = false;
-                    const closeBroadcast = JSON.stringify({
-                        type: 'poll-closed',
-                        poll: room.activePoll,
-                    });
-                    room.peers.forEach((p) => {
-                        if (p.ws.readyState === WebSocket.OPEN)
-                            p.ws.send(closeBroadcast);
-                    });
+                if (!__isMod())
+                    return;
+                const hist = room.pollHistory || [];
+                const poll = hist.find((p) => p.id === data.pollId) || room.activePoll;
+                if (poll) {
+                    poll.isActive = false;
+                    __sendAll({ type: 'poll-closed', poll, history: hist });
                 }
                 return;
             }
-            // Live Polls: Reset / Clear Poll
             if (type === 'poll-reset') {
+                if (!__isMod())
+                    return;
                 room.activePoll = undefined;
-                const resetBroadcast = JSON.stringify({ type: 'poll-reset' });
-                room.peers.forEach((p) => {
-                    if (p.ws.readyState === WebSocket.OPEN)
-                        p.ws.send(resetBroadcast);
-                });
+                room.pollHistory = [];
+                __sendAll({ type: 'poll-reset', history: [] });
                 return;
             }
             // Breakout Rooms: Create & Open
@@ -923,6 +939,8 @@ function __hubAttach(ws) {
                 const leavingPeer = room.peers.get(currentPeerId);
                 const wasHost = (leavingPeer === null || leavingPeer === void 0 ? void 0 : leavingPeer.role) === 'host';
                 room.peers.delete(currentPeerId);
+                if (leavingPeer)
+                    logAtt(room, currentPeerId, leavingPeer.name, leavingPeer.role, 'leave');
                 room.waitingPeers.delete(currentPeerId);
                 const leaveBroadcast = JSON.stringify({
                     type: 'peer-left',
@@ -1019,14 +1037,14 @@ function __hubAttach(ws) {
   function restoreRoom(room) {
     var s = snaps[room];
     if (s && !rooms.has(room)) {
-      rooms.set(room, Object.assign({ peers: new Map(), waitingPeers: new Map() }, s));
+      rooms.set(room, Object.assign({ peers: new Map(), waitingPeers: new Map() }, s, { graceUntil: Date.now() + 25000 }));
     }
   }
   /* hub: replicate room state to every guest so any guest can take over if the host's tab closes */
   setInterval(function () {
     Object.keys(hubs).forEach(function (rid) {
       var r = rooms.get(rid); if (!r) return;
-      var s = { waitingRoomEnabled: r.waitingRoomEnabled, roomLocked: r.roomLocked, notes: r.notes, chatHistory: (r.chatHistory || []).slice(-300), activePoll: r.activePoll, breakoutRooms: r.breakoutRooms, breakoutTimerEnd: r.breakoutTimerEnd, allowSelfUnmute: r.allowSelfUnmute, qaItems: r.qaItems, meetingTimerEnd: r.meetingTimerEnd, meetingTimerLabel: r.meetingTimerLabel };
+      var s = { waitingRoomEnabled: r.waitingRoomEnabled, roomLocked: r.roomLocked, notes: r.notes, chatHistory: (r.chatHistory || []).filter(function (m) { return !m.isPrivate; }).slice(-300), pollHistory: r.pollHistory, attendance: r.attendance, activePoll: r.activePoll, breakoutRooms: r.breakoutRooms, breakoutTimerEnd: r.breakoutTimerEnd, allowSelfUnmute: r.allowSelfUnmute, qaItems: r.qaItems, meetingTimerEnd: r.meetingTimerEnd, meetingTimerLabel: r.meetingTimerLabel };
       var str = JSON.stringify(s);
       if (str === lastSnap[rid]) return;
       lastSnap[rid] = str;
@@ -1383,6 +1401,35 @@ function __hubAttach(ws) {
     }
     return _fetch(u, o);
   };
+
+
+  /* ---------- Role / host-transfer announcements (banner + system line in chat) ---------- */
+  var lastNotice = {};
+  window.__confoNotice = function (title, sub, big) {
+    try {
+      var nowT = Date.now();
+      if (lastNotice[title] && nowT - lastNotice[title] < 4000) return;
+      lastNotice[title] = nowT;
+      var box = document.getElementById('chat-stream-box');
+      if (box) {
+        var r = document.createElement('div');
+        r.className = 'flex justify-center my-1';
+        r.innerHTML = '<div class="px-3 py-1.5 rounded-xl text-[11px] bg-amber-500/10 border border-amber-500/30 text-amber-200 text-center">' + esc(title) + (sub ? ' — ' + esc(sub) : '') + '</div>';
+        box.appendChild(r); box.scrollTop = box.scrollHeight;
+      }
+      if (big) {
+        var b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:72px;left:50%;transform:translateX(-50%) translateY(-20px);opacity:0;z-index:99998;max-width:92vw;padding:14px 22px;border-radius:18px;background:linear-gradient(135deg,#0e7490,#7c3aed);color:#fff;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.35);transition:all .45s cubic-bezier(.2,.9,.3,1.2);cursor:pointer;font-family:system-ui,sans-serif';
+        b.innerHTML = '<div style="font-weight:800;font-size:16px">' + esc(title) + '</div>' + (sub ? '<div style="font-size:12px;opacity:.9;margin-top:3px">' + esc(sub) + '</div>' : '');
+        document.body.appendChild(b);
+        requestAnimationFrame(function () { b.style.opacity = '1'; b.style.transform = 'translateX(-50%) translateY(0)'; });
+        var kill = function () { b.style.opacity = '0'; setTimeout(function () { b.remove(); }, 500); };
+        b.onclick = kill; setTimeout(kill, 7000);
+      }
+    } catch (e) {}
+  };
+  /* Command palette (Ctrl+K) was removed */
+  document.addEventListener('keydown', function (e) { if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) { e.stopImmediatePropagation(); } }, true);
 
   /* ================= Accounts: Firebase Authentication (sign up / sign in / Google / reset) =================
      Fill in the CONFO_CONFIG block at the top of this file. Without it the original local sign-in is kept. */
@@ -1771,6 +1818,10 @@ function __hubAttach(ws) {
       scrollbar-width: none;
     }
   </style>
+<style id="confo-trim">#btn-pro-laser,#btn-pro-noise-gate,#btn-pro-bw-saver,#btn-call-captions,#pro-agenda-timer-box,#modal-command-palette{display:none!important}
+header.glass-nav{padding-right:3.75rem!important}
+#google-tools-corner{position:fixed;top:.75rem;right:.75rem;bottom:auto;left:auto;z-index:60;display:flex;flex-direction:column-reverse;align-items:flex-end}
+#google-tools-popover{margin:.6rem 0 0 0!important}</style>
 </head>
 <body class="bg-obsidian text-slate-100 font-sans antialiased overflow-hidden select-none h-screen flex flex-col">
 
@@ -2223,18 +2274,6 @@ function __hubAttach(ws) {
 
       <!-- 14 Unique Feature Cards Grid (Populated cleanly via JS or static semantic markup) -->
       <div id="welcome-14-features-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-        <!-- Feature 1 -->
-        <div class="feature-card-item feature-card-gradient rounded-2xl p-4 border border-white/10 cursor-pointer group" data-cat="ai" data-action="launch">
-          <div class="flex items-center justify-between mb-3">
-            <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-500/25 to-blue-600/25 border border-neon-cyan/40 flex items-center justify-center text-neon-cyan">
-              <i data-lucide="audio-waveform" class="w-4 h-4"></i>
-            </div>
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-neon-cyan/10 text-neon-cyan border border-neon-cyan/20">01 · DSP</span>
-          </div>
-          <h3 class="text-sm font-bold text-white group-hover:text-neon-cyan transition-colors">Voice-Isolated AI Noise Gate</h3>
-          <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">WebAudio high-pass and studio compressor filter suppresses keyboard clicks and fan hum in real time.</p>
-        </div>
-
         <!-- Feature 2 -->
         <div class="feature-card-item feature-card-gradient rounded-2xl p-4 border border-white/10 cursor-pointer group" data-cat="governance" data-action="launch">
           <div class="flex items-center justify-between mb-3">
@@ -2257,42 +2296,6 @@ function __hubAttach(ws) {
           </div>
           <h3 class="text-sm font-bold text-white group-hover:text-indigo-300 transition-colors">Live Q&A Queue with Upvoting</h3>
           <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">Structured audience question queue ranked by live peer upvotes with host Answered status tracking.</p>
-        </div>
-
-        <!-- Feature 4 -->
-        <div class="feature-card-item feature-card-gradient rounded-2xl p-4 border border-white/10 cursor-pointer group" data-cat="collab" data-action="launch">
-          <div class="flex items-center justify-between mb-3">
-            <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-pink-500/25 to-amber-500/25 border border-pink-400/40 flex items-center justify-center text-pink-300">
-              <i data-lucide="crosshair" class="w-4 h-4"></i>
-            </div>
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-pink-500/10 text-pink-300 border border-pink-500/20">04 · STAGE</span>
-          </div>
-          <h3 class="text-sm font-bold text-white group-hover:text-pink-300 transition-colors">Synced Stage Laser Pointer</h3>
-          <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">Project a glowing real-time laser dot across the video stage and whiteboard so everyone follows your focus.</p>
-        </div>
-
-        <!-- Feature 5 -->
-        <div class="feature-card-item feature-card-gradient rounded-2xl p-4 border border-white/10 cursor-pointer group" data-cat="productivity" data-action="launch">
-          <div class="flex items-center justify-between mb-3">
-            <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-500/25 to-orange-600/25 border border-amber-400/40 flex items-center justify-center text-amber-300">
-              <i data-lucide="timer" class="w-4 h-4"></i>
-            </div>
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20">05 · SYNC</span>
-          </div>
-          <h3 class="text-sm font-bold text-white group-hover:text-amber-300 transition-colors">Synchronized Agenda Timer</h3>
-          <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">Shared Pomodoro and sprint countdown bar pinned to every attendee's header with gentle completion chimes.</p>
-        </div>
-
-        <!-- Feature 6 -->
-        <div class="feature-card-item feature-card-gradient rounded-2xl p-4 border border-white/10 cursor-pointer group" data-cat="productivity" data-action="launch">
-          <div class="flex items-center justify-between mb-3">
-            <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-500/25 to-teal-600/25 border border-emerald-400/40 flex items-center justify-center text-emerald-300">
-              <i data-lucide="wifi" class="w-4 h-4"></i>
-            </div>
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">06 · ECO</span>
-          </div>
-          <h3 class="text-sm font-bold text-white group-hover:text-emerald-300 transition-colors">Low-Bandwidth Audio Saver</h3>
-          <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">Instantly pause heavy camera streams on congested Wi-Fi while maintaining crisp 48kHz voice channels.</p>
         </div>
 
         <!-- Feature 7 -->
@@ -2367,29 +2370,7 @@ function __hubAttach(ws) {
           <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">Split teams into timed Alpha, Beta, and Gamma pods with host-wide megaphone announcements.</p>
         </div>
 
-        <!-- Feature 13 -->
-        <div class="feature-card-item feature-card-gradient rounded-2xl p-4 border border-white/10 cursor-pointer group" data-cat="productivity" data-action="palette">
-          <div class="flex items-center justify-between mb-3">
-            <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-slate-500/25 to-cyan-500/25 border border-slate-400/40 flex items-center justify-center text-white">
-              <i data-lucide="command" class="w-4 h-4"></i>
-            </div>
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-white/10 text-slate-200 border border-white/15">13 · CTRL+K</span>
-          </div>
-          <h3 class="text-sm font-bold text-white group-hover:text-neon-cyan transition-colors">Universal Command Palette</h3>
-          <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">Press Ctrl+K anywhere to jump to Google Tools, start a room, toggle captions, or launch polls instantly.</p>
-        </div>
-
-        <!-- Feature 14 -->
-        <div class="feature-card-item feature-card-gradient rounded-2xl p-4 border border-white/10 cursor-pointer group" data-cat="ai" data-action="launch">
-          <div class="flex items-center justify-between mb-3">
-            <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-teal-500/25 to-cyan-500/25 border border-teal-400/40 flex items-center justify-center text-teal-300">
-              <i data-lucide="languages" class="w-4 h-4"></i>
-            </div>
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-teal-500/10 text-teal-300 border border-teal-500/20">14 · GLOBAL</span>
-          </div>
-          <h3 class="text-sm font-bold text-white group-hover:text-teal-300 transition-colors">Multilingual Neural Subtitles</h3>
-          <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">Live voice recognition pairs with instant AI translation across 10+ global languages and executive debriefs.</p>
-        </div>
+        
       </div>
 
       <!-- Website Footer Bar -->
@@ -3528,7 +3509,7 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
               <span id="pro-ambience-state" class="text-[10px] text-slate-400 font-mono">Off</span>
             </button>
 
-            <div class="pt-1.5 border-t border-white/10">
+            <div id="pro-agenda-timer-box" class="pt-1.5 border-t border-white/10">
               <div class="text-[10px] text-slate-400 font-semibold mb-1.5">Synced Agenda Timer (Host)</div>
               <div class="grid grid-cols-3 gap-1">
                 <button class="btn-pro-timer py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 font-mono text-[10px] font-bold" data-sec="300">5 min</button>
@@ -3920,9 +3901,9 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
   <!-- ========================================================================= -->
   <!-- CORNER WIDGET: ALL GOOGLE WORKSPACE TOOLS LAUNCHER                        -->
   <!-- ========================================================================= -->
-  <div id="google-tools-corner" class="fixed bottom-4 left-4 z-50">
+  <div id="google-tools-corner" class="">
     <!-- Popover Menu -->
-    <div id="google-tools-popover" class="hidden mb-2.5 w-80 sm:w-96 p-4 rounded-3xl glass-panel border border-white/15 shadow-[0_24px_70px_rgba(0,0,0,0.92)]">
+    <div id="google-tools-popover" class="hidden w-80 max-w-[92vw] sm:w-96 p-4 rounded-3xl glass-panel border border-white/15 shadow-[0_24px_70px_rgba(0,0,0,0.92)]">
       <div class="flex items-center justify-between pb-2.5 mb-3 border-b border-white/10">
         <div class="flex items-center gap-2">
           <div class="w-7 h-7 rounded-xl bg-white flex items-center justify-center shadow-sm">
@@ -4001,18 +3982,12 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
     </div>
 
     <!-- Corner Trigger Pill -->
-    <button id="btn-toggle-google-corner" class="flex items-center gap-2 px-3.5 py-2 rounded-2xl glass-panel border border-white/15 hover:border-neon-cyan/50 shadow-[0_8px_30px_rgba(0,0,0,0.75)] text-xs font-bold text-white hover:text-neon-cyan transition-all group">
-      <span class="w-5 h-5 rounded-md bg-white flex items-center justify-center shrink-0">
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24">
+    <button id="btn-toggle-google-corner" title="Google tools" class="w-10 h-10 rounded-full bg-white flex items-center justify-center shadow-[0_6px_24px_rgba(0,0,0,0.6)] border border-white/40 hover:scale-105 transition-transform"><svg class="w-5 h-5" viewBox="0 0 24 24">
           <path fill="#4285F4" d="M23.745 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-8.97z"/>
           <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24z"/>
           <path fill="#FBBC05" d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14z"/>
           <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96z"/>
-        </svg>
-      </span>
-      <span class="hidden sm:inline">Google Tools</span>
-      <i data-lucide="grid" class="w-3.5 h-3.5 text-neon-cyan"></i>
-    </button>
+        </svg></button>
   </div>
 
   <!-- ========================================================================= -->
@@ -4159,6 +4134,9 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
         rawCameraStream: null,
         processedVideoStream: null,
         activePoll: null,
+        pollHistory: [],
+        attendance: [],
+        chatLog: [],
         hasVotedInCurrentPoll: false,
         breakoutRooms: null,
         breakoutTimerEnd: null,
@@ -6274,195 +6252,113 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
       function renderActivePollUI() {
         const container = document.getElementById('polls-container');
         const dot = document.getElementById('poll-active-dot');
-        if (dot) {
-          dot.classList.toggle('hidden', !(state.activePoll && state.activePoll.isActive));
-        }
+        const hist = Array.isArray(state.pollHistory) ? state.pollHistory : [];
+        const live = hist.find((p) => p.isActive);
+        if (dot) dot.classList.toggle('hidden', !live);
         if (!container) return;
+        const keep = {};
+        ['input-poll-question', 'input-poll-opt-1', 'input-poll-opt-2', 'input-poll-opt-3', 'input-poll-opt-4'].forEach((id) => {
+          const el = document.getElementById(id);
+          if (el) keep[id] = el.value;
+        });
+        const isHost = state.myRole === 'host' || state.myRole === 'co-host';
+        const headcount = 1 + state.remotePeers.size;
+        const inp = 'w-full px-3 py-2 rounded-xl glass-input text-white text-xs focus:outline-none focus:ring-1 focus:ring-neon-cyan/50';
+        let html = '';
 
-        if (!state.activePoll) {
-          // Show interactive poll creator
-          container.innerHTML = `
-            <div class="space-y-3">
-              <div>
-                <label class="block text-slate-300 font-semibold mb-1">Poll Question</label>
-                <input id="input-poll-question" type="text" placeholder="e.g., Should we approve the Q3 Architecture Migration?" class="w-full px-3 py-2.5 rounded-xl glass-input text-white focus:outline-none placeholder-slate-500 text-xs">
+        if (isHost) {
+          html += `
+            <div class="p-3 rounded-2xl bg-neon-cyan/5 border border-neon-cyan/25 space-y-2">
+              <div class="text-[11px] font-bold text-neon-cyan uppercase tracking-wider">New poll ${live ? '(closes the live one)' : ''}</div>
+              <input id="input-poll-question" type="text" placeholder="Poll question, e.g. Which topic next?" class="${inp}" />
+              <input id="input-poll-opt-1" type="text" placeholder="Option 1" class="${inp}" />
+              <input id="input-poll-opt-2" type="text" placeholder="Option 2" class="${inp}" />
+              <input id="input-poll-opt-3" type="text" placeholder="Option 3 (optional)" class="${inp}" />
+              <input id="input-poll-opt-4" type="text" placeholder="Option 4 (optional)" class="${inp}" />
+              <button id="btn-submit-create-poll" class="w-full py-2.5 rounded-xl bg-neon-cyan hover:bg-cyan-300 text-obsidian font-bold text-xs transition-all">Launch Live Poll</button>
+            </div>`;
+        } else if (!hist.length) {
+          html += '<div class="p-4 rounded-2xl bg-white/5 border border-white/10 text-center text-slate-400">No polls yet. When the host launches a poll it appears here.</div>';
+        }
+
+        if (hist.length) {
+          html += `<div class="flex items-center justify-between pt-1"><div class="text-[11px] font-bold text-slate-300 uppercase tracking-wider">Polls (${hist.length})</div>${isHost ? '<button id="btn-poll-clear-all" class="text-[10px] text-slate-400 hover:text-red-300 underline">Clear all</button>' : ''}</div>`;
+        }
+        hist.slice().reverse().forEach((poll) => {
+          const num = hist.indexOf(poll) + 1;
+          const total = poll.options.reduce((s, o) => s + (o.votes || 0), 0);
+          const voted = Array.isArray(poll.votedPeerIds) && poll.votedPeerIds.includes(state.myPeerId);
+          const canVote = poll.isActive && !voted && !isHost;
+          const hostCanVote = poll.isActive && !voted && isHost;
+          let opts = '';
+          poll.options.forEach((o, idx) => {
+            const pct = total ? Math.round(((o.votes || 0) / total) * 100) : 0;
+            opts += canVote
+              ? `<button class="btn-poll-vote w-full text-left px-3 py-2 rounded-xl bg-white/5 hover:bg-neon-cyan/20 border border-white/10 hover:border-neon-cyan/50 text-white text-xs font-semibold transition-all" data-poll="${escapeHtml(poll.id)}" data-idx="${idx}">${escapeHtml(o.text)}</button>`
+              : `<div class="${hostCanVote ? 'btn-poll-vote cursor-pointer ' : ''}relative overflow-hidden rounded-xl bg-white/5 border border-white/10 px-3 py-2" ${hostCanVote ? `data-poll="${escapeHtml(poll.id)}" data-idx="${idx}" title="Click to cast your vote"` : ''}>
+                   <div class="absolute inset-y-0 left-0 bg-gradient-to-r from-neon-cyan/35 to-neon-magenta/25 transition-all duration-700" style="width:${pct}%"></div>
+                   <div class="relative flex items-center justify-between text-xs font-semibold text-white gap-2"><span>${escapeHtml(o.text)}</span><span class="font-mono text-[11px] text-slate-200">${o.votes || 0} · ${pct}%</span></div>
+                 </div>`;
+          });
+          const voters = (poll.votedPeerIds || []).length;
+          html += `
+            <div class="p-3 rounded-2xl border ${poll.isActive ? 'bg-neon-magenta/5 border-neon-magenta/30' : 'bg-white/5 border-white/10'} space-y-2">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[10px] font-mono px-1.5 py-0.5 rounded ${poll.isActive ? 'bg-neon-magenta/20 text-neon-magenta' : 'bg-white/10 text-slate-300'}">#${num} · ${poll.isActive ? 'LIVE' : 'CLOSED'}</span>
+                <span class="text-[10px] text-slate-400 truncate">by ${escapeHtml(poll.creatorName || 'Host')}</span>
               </div>
-              <div>
-                <label class="block text-slate-300 font-semibold mb-1">Option 1</label>
-                <input id="input-poll-opt-1" type="text" placeholder="e.g., Yes, approve immediately" value="Yes, approve immediately" class="w-full px-3 py-2 rounded-xl glass-input text-white focus:outline-none placeholder-slate-500 text-xs">
+              <div class="text-xs font-bold text-white leading-snug">${escapeHtml(poll.question)}</div>
+              <div class="space-y-1.5">${opts}</div>
+              <div class="flex items-center justify-between text-[10px] text-slate-400">
+                <span>${voters} of ${Math.max(headcount, voters)} voted${voted ? ' · you voted' : ''}</span>
+                ${isHost && poll.isActive ? `<button class="btn-poll-close px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 font-bold" data-poll="${escapeHtml(poll.id)}">Close poll</button>` : ''}
               </div>
-              <div>
-                <label class="block text-slate-300 font-semibold mb-1">Option 2</label>
-                <input id="input-poll-opt-2" type="text" placeholder="e.g., Need 1 more week of testing" value="Need 1 more week of testing" class="w-full px-3 py-2 rounded-xl glass-input text-white focus:outline-none placeholder-slate-500 text-xs">
-              </div>
-              <div>
-                <label class="block text-slate-300 font-semibold mb-1">Option 3 (Optional)</label>
-                <input id="input-poll-opt-3" type="text" placeholder="e.g., Reject or postpone" value="Reject or postpone" class="w-full px-3 py-2 rounded-xl glass-input text-white focus:outline-none placeholder-slate-500 text-xs">
-              </div>
-              <button id="btn-submit-create-poll" class="w-full py-2.5 mt-2 rounded-xl bg-neon-cyan hover:bg-cyan-300 text-obsidian font-bold text-xs transition-all shadow-[0_0_20px_rgba(0,223,216,0.35)]">
-                Launch Live Poll
-              </button>
-            </div>
-          `;
+            </div>`;
+        });
 
-          const btnSubmit = document.getElementById('btn-submit-create-poll');
-          if (btnSubmit) {
-            btnSubmit.addEventListener('click', () => {
-              const question = (document.getElementById('input-poll-question')?.value || '').trim();
-              const o1 = (document.getElementById('input-poll-opt-1')?.value || '').trim();
-              const o2 = (document.getElementById('input-poll-opt-2')?.value || '').trim();
-              const o3 = (document.getElementById('input-poll-opt-3')?.value || '').trim();
+        container.innerHTML = html;
+        Object.keys(keep).forEach((id) => { const el = document.getElementById(id); if (el) el.value = keep[id]; });
 
-              if (!question) {
-                showToast('Please enter a poll question', 'warning');
-                return;
-              }
-              if (!o1 || !o2) {
-                showToast('Please provide at least 2 options', 'warning');
-                return;
-              }
-
-              const options = [
-                { id: 'opt-1', text: o1, votes: 0 },
-                { id: 'opt-2', text: o2, votes: 0 },
-              ];
-              if (o3) options.push({ id: 'opt-3', text: o3, votes: 0 });
-
-              const pollData = {
-                id: 'poll-' + Date.now(),
-                question,
-                options,
-                isActive: true,
-                votedPeerIds: [],
-              };
-
-              state.activePoll = pollData;
-              state.hasVotedInCurrentPoll = false;
-
-              if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-                state.ws.send(JSON.stringify({
-                  type: 'poll-create',
-                  question,
-                  options: options.map((o) => o.text),
-                  poll: pollData,
-                }));
-              }
-
-              renderActivePollUI();
-              showToast('Live poll created and published to meeting!', 'success');
+        const submit = document.getElementById('btn-submit-create-poll');
+        if (submit) {
+          submit.addEventListener('click', () => {
+            const q = (document.getElementById('input-poll-question')?.value || '').trim();
+            const opts = [1, 2, 3, 4].map((n) => (document.getElementById('input-poll-opt-' + n)?.value || '').trim()).filter(Boolean);
+            if (!q) { showToast('Please enter a poll question', 'warning'); return; }
+            if (opts.length < 2) { showToast('Please provide at least 2 options', 'warning'); return; }
+            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+              state.ws.send(JSON.stringify({ type: 'poll-create', question: q, options: opts, poll: { id: 'poll-' + Date.now(), question: q, options: opts } }));
+              ['input-poll-question', 'input-poll-opt-1', 'input-poll-opt-2', 'input-poll-opt-3', 'input-poll-opt-4'].forEach((id) => { const el = document.getElementById(id); if (el) el.value = ''; });
               playChime('join');
-            });
-          }
-          return;
-        }
-
-        // Active or Closed Poll Render
-        const poll = state.activePoll;
-        const totalVotes = poll.options.reduce((sum, o) => sum + (o.votes || 0), 0);
-
-        let optionsHtml = '';
-        poll.options.forEach((opt, idx) => {
-          const pct = totalVotes > 0 ? Math.round(((opt.votes || 0) / totalVotes) * 100) : 0;
-          const canVote = poll.isActive && !state.hasVotedInCurrentPoll;
-
-          optionsHtml += `
-            <div class="p-3 rounded-2xl bg-white/5 border border-white/10 space-y-2">
-              <div class="flex items-center justify-between text-xs font-semibold gap-2">
-                <span class="text-white">${escapeHtml(opt.text)}</span>
-                <span class="text-neon-cyan font-mono shrink-0">${pct}% (${opt.votes || 0})</span>
-              </div>
-              <div class="w-full h-2 rounded-full bg-white/10 overflow-hidden">
-                <div class="h-full bg-gradient-to-r from-neon-cyan to-neon-indigo rounded-full transition-all duration-500" style="width: ${pct}%"></div>
-              </div>
-              ${canVote ? `
-                <button class="btn-cast-vote w-full py-1.5 rounded-lg bg-neon-cyan/20 hover:bg-neon-cyan/30 text-neon-cyan border border-neon-cyan/30 font-semibold text-[11px] transition-all" data-opt-id="${escapeHtml(opt.id)}" data-opt-index="${idx}">
-                  Vote for this option
-                </button>
-              ` : ''}
-            </div>
-          `;
-        });
-
-        container.innerHTML = `
-          <div class="space-y-4">
-            <div class="flex items-center justify-between">
-              <span class="px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider ${poll.isActive ? 'bg-neon-cyan/20 text-neon-cyan border border-neon-cyan/30 animate-pulse' : 'bg-white/10 text-slate-400'}">
-                ${poll.isActive ? '● Live Voting' : 'Voting Ended'}
-              </span>
-              <span class="text-slate-400 font-mono text-[11px]">${totalVotes} total votes</span>
-            </div>
-
-            <h4 class="text-sm font-bold text-white leading-snug">${escapeHtml(poll.question)}</h4>
-
-            <div class="space-y-2.5">
-              ${optionsHtml}
-            </div>
-
-            ${state.hasVotedInCurrentPoll ? `
-              <div class="p-2.5 rounded-xl bg-neon-green/10 border border-neon-green/30 text-neon-green text-[11px] flex items-center gap-2">
-                <i data-lucide="check" class="w-3.5 h-3.5"></i>
-                <span>Your vote has been recorded</span>
-              </div>
-            ` : ''}
-
-            <div class="pt-2 border-t border-white/10 flex items-center justify-between gap-2">
-              ${poll.isActive ? `
-                <button id="btn-poll-close-active" class="px-3 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-[11px] font-semibold transition-all">
-                  End Poll
-                </button>
-              ` : `
-                <button id="btn-poll-create-new" class="px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-white text-[11px] font-semibold transition-all">
-                  Create New Poll
-                </button>
-              `}
-            </div>
-          </div>
-        `;
-
-        // Bind voting buttons
-        container.querySelectorAll('.btn-cast-vote').forEach((b) => {
-          b.addEventListener('click', () => {
-            const optionId = b.dataset.optId;
-            const optionIndex = parseInt(b.dataset.optIndex || '0', 10);
-            state.hasVotedInCurrentPoll = true;
-            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-              state.ws.send(JSON.stringify({ type: 'poll-vote', pollId: poll.id, optionId, optionIndex }));
+              showToast('Poll published to everyone', 'success');
             } else {
-              const found = poll.options.find((o, idx) => o.id === optionId || idx === optionIndex);
-              if (found) found.votes = (found.votes || 0) + 1;
+              showToast('Not connected yet — try again in a moment', 'warning');
             }
-            playChime('reaction');
-            showToast('Vote submitted successfully!', 'success');
+          });
+        }
+        container.querySelectorAll('.btn-poll-vote').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const poll = (state.pollHistory || []).find((p) => p.id === btn.dataset.poll);
+            const idx = parseInt(btn.dataset.idx, 10);
+            if (!poll || !poll.isActive) return;
+            if (poll.options[idx]) poll.options[idx].votes = (poll.options[idx].votes || 0) + 1;
+            poll.votedPeerIds = (poll.votedPeerIds || []).concat(state.myPeerId);
+            if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ type: 'poll-vote', pollId: poll.id, optionIndex: idx }));
+            playChime('click');
             renderActivePollUI();
           });
         });
-
-        const btnClose = document.getElementById('btn-poll-close-active');
-        if (btnClose) {
-          btnClose.addEventListener('click', () => {
-            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-              state.ws.send(JSON.stringify({ type: 'poll-close' }));
-            } else if (state.activePoll) {
-              state.activePoll.isActive = false;
-              renderActivePollUI();
-            }
-            showToast('Poll concluded', 'info');
+        container.querySelectorAll('.btn-poll-close').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ type: 'poll-close', pollId: btn.dataset.poll }));
+          });
+        });
+        const clearAll = document.getElementById('btn-poll-clear-all');
+        if (clearAll) {
+          clearAll.addEventListener('click', () => {
+            if (confirm('Remove all polls and results for everyone?') && state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ type: 'poll-reset' }));
           });
         }
-
-        const btnNew = document.getElementById('btn-poll-create-new');
-        if (btnNew) {
-          btnNew.addEventListener('click', () => {
-            state.activePoll = null;
-            state.hasVotedInCurrentPoll = false;
-            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-              state.ws.send(JSON.stringify({ type: 'poll-reset' }));
-            }
-            renderActivePollUI();
-          });
-        }
-
-        if (window.lucide) window.lucide.createIcons();
       }
 
       function connectWebRTCBridge() {
@@ -6481,6 +6377,7 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
             roomId: state.roomId,
             peerId: state.myPeerId,
             name: state.myName,
+            email: (typeof getStoredUserProfile === 'function' ? (getStoredUserProfile().email || '') : ''),
             isMuted: state.isMicMuted,
             isVideoOff: state.isVideoOff,
           }));
@@ -6542,6 +6439,9 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
 
               // Restore Active Poll
               state.activePoll = data.activePoll || null;
+              state.pollHistory = data.pollHistory || [];
+              state.attendance = data.attendance || [];
+              state.chatLog = [];
               state.hasVotedInCurrentPoll = !!(state.activePoll && Array.isArray(state.activePoll.votedPeerIds) && state.activePoll.votedPeerIds.includes(state.myPeerId));
               renderActivePollUI();
 
@@ -6551,6 +6451,17 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
 
               // Clear any stale remote tiles before rendering existing peers
               document.querySelectorAll('[id^="remote-tile-"]').forEach((el) => el.remove());
+              {
+                const liveIds = new Set((data.existingPeers || []).map((p) => p.peerId));
+                Array.from(state.remotePeers.keys()).forEach((id) => {
+                  if (liveIds.has(id)) return;
+                  const pc = state.peerConnections.get(id);
+                  if (pc) { try { pc.close(); } catch (e) {} state.peerConnections.delete(id); }
+                  state.pendingIceCandidates.delete(id);
+                  state.remoteStreams.delete(id);
+                  state.remotePeers.delete(id);
+                });
+              }
 
               // Eagerly render tiles & establish WebRTC connection with existing peers
               if (data.existingPeers && data.existingPeers.length > 0) {
@@ -6610,11 +6521,14 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
                 updateRoleUI();
                 applyMicUI();
                 showToast(`Your role was updated to: ${role.toUpperCase()}`, 'success');
+                window.__confoNotice(role === 'co-host' ? '🛡️ You have been made Co-Host' : role === 'host' ? '👑 You are now the Host' : 'Your Co-Host role was removed', data.updatedBy ? `by ${data.updatedBy}` : '', role !== 'participant' || true);
               } else {
                 const p = state.remotePeers.get(peerId);
                 if (p) {
                   p.role = role;
                   updateRemoteCard(peerId);
+                  window.__confoNotice(role === 'co-host' ? `🛡️ ${p.name || 'Participant'} is now Co-Host` : role === 'host' ? `👑 ${p.name || 'Participant'} is now the Host` : `${p.name || 'Participant'} is no longer Co-Host`, data.updatedBy ? `by ${data.updatedBy}` : '', false);
+                  showToast(role === 'co-host' ? `🛡️ ${p.name} is now Co-Host` : role === 'host' ? `👑 ${p.name} is now the Host` : `${p.name} is no longer Co-Host`, 'info');
                 }
               }
               updateRosterList();
@@ -6630,12 +6544,15 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
                 applyMicUI();
                 playChime('join');
                 showToast('👑 You are now the Host of this meeting!', 'success');
+                window.__confoNotice('👑 You are now the Host', 'You now control this meeting' + (data.autoPromoted ? ' (the previous host left)' : ''), true);
               } else if (previousHostPeerId === state.myPeerId) {
                 state.myRole = 'co-host';
                 updateRoleUI();
                 showToast(`You transferred Host rights to ${newHostName}. You are now Co-Host.`, 'info');
+                window.__confoNotice('🛡️ You have been made Co-Host', `Host rights moved to ${newHostName}`, true);
               } else {
                 showToast(`👑 ${newHostName} is now the Meeting Host`, 'info');
+                window.__confoNotice(`👑 ${newHostName} is now the Host`, data.autoPromoted ? `${data.previousHostName || 'The host'} left the meeting` : 'Host rights were transferred', false);
               }
               const pNew = state.remotePeers.get(newHostPeerId);
               if (pNew) { pNew.role = 'host'; updateRemoteCard(newHostPeerId); }
@@ -6844,6 +6761,10 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
             // Chat Message (Public or Private DM)
             if (type === 'chat-message') {
               renderIncomingMessage(data.message);
+              if (data.message && data.message.isPrivate && data.message.peerId !== state.myPeerId) {
+                showToast(`🔒 Private message from ${data.message.sender}: ${String(data.message.text).slice(0, 70)}`, 'info');
+                playChime('click');
+              }
               return;
             }
 
@@ -6877,6 +6798,7 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
             // Live Poll Created
             if (type === 'poll-created') {
               state.activePoll = data.poll;
+              state.pollHistory = data.history || state.pollHistory || [];
               state.hasVotedInCurrentPoll = !!(data.poll?.votedPeerIds?.includes(state.myPeerId));
               renderActivePollUI();
               showToast(`📊 New live poll: ${data.poll.question}`, 'info');
@@ -6887,6 +6809,7 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
             // Live Poll Updated (Votes counted)
             if (type === 'poll-updated') {
               state.activePoll = data.poll;
+              state.pollHistory = data.history || state.pollHistory || [];
               state.hasVotedInCurrentPoll = !!(data.poll?.votedPeerIds?.includes(state.myPeerId));
               renderActivePollUI();
               return;
@@ -6895,13 +6818,23 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
             // Live Poll Closed
             if (type === 'poll-closed') {
               state.activePoll = data.poll;
+              state.pollHistory = data.history || state.pollHistory || [];
               renderActivePollUI();
               showToast('Poll voting concluded', 'info');
               return;
             }
 
+            if (type === 'attendance-updated') {
+              state.attendance = data.attendance || [];
+              if (data.entry && data.poster === state.myPeerId) {
+                window.__pushAttendance && window.__pushAttendance({ action: 'append', room: state.roomId, event: data.event, name: data.entry.name, email: data.entry.email || '', role: data.entry.role, time: new Date(data.entry.time).toISOString() });
+              }
+              return;
+            }
+
             // Live Poll Reset
             if (type === 'poll-reset') {
+              state.pollHistory = data.history || [];
               state.activePoll = null;
               state.hasVotedInCurrentPoll = false;
               renderActivePollUI();
@@ -7293,6 +7226,7 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
       }
 
       function updateRoleUI() {
+        try { renderActivePollUI(); } catch (e) {}
         const roleBadge = document.getElementById('tile-local-role-badge');
         if (roleBadge) {
           roleBadge.textContent = state.myRole.toUpperCase();
@@ -7352,70 +7286,135 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
           stopMeetingRecording();
           return;
         }
-
         try {
           state.recordedChunks = [];
-          let recordStream = state.localStream;
-
-          // If screen share is active, prioritize recording screen + audio
-          if (state.screenStream) {
-            recordStream = state.screenStream;
-          }
-
-          if (!recordStream) {
-            showToast('No active media stream found to record', 'warning');
-            return;
-          }
-
-          const options = { mimeType: 'video/webm;codecs=vp9,opus' };
-          let recorder;
-          try {
-            recorder = new MediaRecorder(recordStream, options);
-          } catch (e) {
-            recorder = new MediaRecorder(recordStream);
-          }
-
-          state.mediaRecorder = recorder;
-          recorder.ondataavailable = (e) => {
-            if (e.data.size > 0) state.recordedChunks.push(e.data);
+          const W = 1280, H = 720;
+          const cv = document.createElement('canvas');
+          cv.width = W; cv.height = H;
+          const g = cv.getContext('2d');
+          const AC = window.AudioContext || window.webkitAudioContext;
+          const ac = new AC();
+          if (ac.state === 'suspended') ac.resume();
+          const dest = ac.createMediaStreamDestination();
+          const wired = new Set();
+          const syncAudio = () => {
+            const streams = [];
+            if (state.rawCameraStream) streams.push(state.rawCameraStream);
+            if (state.micProcessedStream) streams.push(state.micProcessedStream);
+            if (state.localStream) streams.push(state.localStream);
+            if (state.screenStream) streams.push(state.screenStream);
+            state.remoteStreams.forEach((s) => streams.push(s));
+            document.querySelectorAll('[id^="remote-tile-"] video, [id^="remote-tile-"] audio').forEach((el) => { if (el.srcObject) streams.push(el.srcObject); });
+            const localIds = new Set();
+            [state.rawCameraStream, state.micProcessedStream, state.localStream].forEach((s) => { if (s) s.getAudioTracks().forEach((t) => localIds.add(t.id)); });
+            const seenLocal = { done: false };
+            streams.forEach((s) => {
+              if (!s) return;
+              s.getAudioTracks().forEach((t) => {
+                if (t.readyState !== 'live' || wired.has(t.id)) return;
+                // wire only one local mic track (avoid doubling), every remote track
+                if (localIds.has(t.id)) { if (seenLocal.done || wired.has('local-mic')) return; seenLocal.done = true; wired.add('local-mic'); }
+                try {
+                  ac.createMediaStreamSource(new MediaStream([t])).connect(dest);
+                  wired.add(t.id);
+                } catch (e) {}
+              });
+            });
           };
+          const initials = (n) => String(n || '?').trim().split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
+          const tiles = () => {
+            const list = [];
+            const lv = document.getElementById('tile-local-video');
+            list.push({ id: 'local', name: (state.myName || 'You') + ' (You)', video: lv, sharing: !!state.isScreenSharing });
+            state.remotePeers.forEach((p, id) => {
+              list.push({ id, name: p.name || 'Guest', video: document.querySelector(`#remote-tile-${id} video`), sharing: !!p.isScreenSharing });
+            });
+            return list;
+          };
+          const drawTile = (t, x, y, w, h) => {
+            g.fillStyle = '#0b1020'; g.fillRect(x, y, w, h);
+            const v = t.video;
+            const ok = v && v.readyState >= 2 && v.videoWidth > 0 && v.offsetParent !== null;
+            if (ok) {
+              const r = Math.min(w / v.videoWidth, h / v.videoHeight);
+              const dw = v.videoWidth * r, dh = v.videoHeight * r;
+              try { g.drawImage(v, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh); } catch (e) {}
+            } else {
+              g.fillStyle = '#1e293b';
+              g.beginPath(); g.arc(x + w / 2, y + h / 2, Math.min(w, h) * 0.18, 0, Math.PI * 2); g.fill();
+              g.fillStyle = '#e2e8f0'; g.font = `bold ${Math.round(Math.min(w, h) * 0.14)}px sans-serif`;
+              g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(initials(t.name), x + w / 2, y + h / 2);
+            }
+            g.fillStyle = 'rgba(0,0,0,0.55)';
+            g.fillRect(x + 8, y + h - 30, Math.min(w - 16, g.measureText(t.name).width + 24), 22);
+            g.fillStyle = '#fff'; g.font = '13px sans-serif'; g.textAlign = 'left'; g.textBaseline = 'middle';
+            g.fillText(t.name, x + 16, y + h - 19);
+            g.strokeStyle = 'rgba(255,255,255,0.12)'; g.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+          };
+          const draw = () => {
+            g.fillStyle = '#05070f'; g.fillRect(0, 0, W, H);
+            const all = tiles();
+            const share = all.find((t) => t.sharing);
+            if (share && all.length > 1) {
+              drawTile(share, 0, 0, Math.round(W * 0.76), H);
+              const rest = all.filter((t) => t !== share);
+              const rh = Math.min(H / rest.length, 200);
+              rest.forEach((t, i) => drawTile(t, Math.round(W * 0.76) + 6, i * (rh + 4), W - Math.round(W * 0.76) - 6, rh));
+            } else {
+              const n = all.length;
+              const cols = Math.ceil(Math.sqrt(n * (W / H) / 1.0));
+              const c = Math.max(1, Math.min(n, cols));
+              const rows = Math.ceil(n / c);
+              const tw = W / c, th = H / rows;
+              all.forEach((t, i) => drawTile(t, (i % c) * tw + 2, Math.floor(i / c) * th + 2, tw - 4, th - 4));
+            }
+          };
+          syncAudio(); draw();
+          const worker = new Worker(URL.createObjectURL(new Blob(['setInterval(function(){postMessage(0)},50)'], { type: 'text/javascript' })));
+          let tick = 0;
+          worker.onmessage = () => { draw(); if (++tick % 20 === 0) syncAudio(); };
 
+          const out = new MediaStream([...cv.captureStream(20).getVideoTracks(), ...dest.stream.getAudioTracks()]);
+          const mimes = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm'];
+          const mime = mimes.find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m));
+          const recorder = mime ? new MediaRecorder(out, { mimeType: mime, videoBitsPerSecond: 2500000 }) : new MediaRecorder(out);
+          state.mediaRecorder = recorder;
+          state.recCleanup = () => {
+            try { worker.terminate(); } catch (e) {}
+            try { out.getTracks().forEach((t) => t.stop()); } catch (e) {}
+            try { ac.close(); } catch (e) {}
+          };
+          recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) state.recordedChunks.push(e.data); };
           recorder.onstop = () => {
+            if (state.recCleanup) { state.recCleanup(); state.recCleanup = null; }
             const blob = new Blob(state.recordedChunks, { type: 'video/webm' });
             const url = URL.createObjectURL(blob);
             const player = document.getElementById('recording-preview-player');
             player.src = url;
-
             const modal = document.getElementById('modal-recording');
             modal.classList.remove('hidden');
             modal.classList.add('flex');
-
             document.getElementById('btn-download-recording').onclick = () => {
               const a = document.createElement('a');
               a.href = url;
-              a.download = `1M Confo_Recording_${state.roomId}_${Date.now()}.webm`;
+              a.download = `1M-Confo_Recording_${state.roomId}_${Date.now()}.webm`;
               a.click();
               showToast('Recording downloaded successfully!', 'success');
             };
           };
-
           recorder.start(1000);
           state.isRecording = true;
           state.recordingSeconds = 0;
-
           document.getElementById('call-rec-badge').classList.remove('hidden');
           document.getElementById('call-rec-badge').classList.add('flex');
           document.getElementById('btn-call-record').classList.add('bg-red-500/25', 'text-red-400', 'border-red-500/50');
-
           state.recordingTimerInterval = setInterval(() => {
             state.recordingSeconds++;
             const m = String(Math.floor(state.recordingSeconds / 60)).padStart(2, '0');
             const s = String(state.recordingSeconds % 60).padStart(2, '0');
             document.getElementById('call-rec-timer').textContent = `${m}:${s}`;
           }, 1000);
-
-          showToast('Recording started (Video & Audio)', 'success');
-
+          showToast('Recording the whole meeting (everyone’s video + audio)', 'success');
         } catch (err) {
           console.error('Recording initialization error:', err);
           showToast('Could not start recording in this browser', 'warning');
@@ -7465,6 +7464,7 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
         if (msg.id && state.renderedChatIds.has(msg.id)) return;
         if (dedupKey) state.renderedChatIds.add(dedupKey);
         if (msg.id) state.renderedChatIds.add(msg.id);
+        if (!msg.isPrivate) { (state.chatLog = state.chatLog || []).push({ sender: msg.sender, time: msg.time, text: msg.text }); }
 
         const isMe = msg.peerId === state.myPeerId;
         const isPrivate = !!msg.isPrivate;
@@ -9416,9 +9416,62 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
           }
         }
 
+        function startYouTubeAmbience() {
+          const VID = '_4kHxtiuML0';
+          let holder = document.getElementById('yt-ambience-holder');
+          if (!holder) {
+            holder = document.createElement('div');
+            holder.id = 'yt-ambience-holder';
+            holder.style.cssText = 'position:fixed;left:12px;bottom:96px;z-index:45;width:220px;border-radius:14px;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.7);border:1px solid rgba(255,255,255,.15);background:#000';
+            document.body.appendChild(holder);
+          }
+          holder.style.display = 'block';
+          holder.innerHTML = '<div style="font:600 10px system-ui;color:#94e8e4;padding:5px 9px;background:#0b1020">🎧 Meditation music</div><div id="yt-ambience-player"></div>';
+          let player = null, dead = false;
+          const fallback = (why) => {
+            if (dead) return;
+            showToast(why + ' — switching to Deep Focus tones', 'warning');
+            state.ambienceMode = 'focus';
+            startAmbienceAudio('focus');
+            const lbl = document.getElementById('pro-ambience-state');
+            if (lbl) lbl.textContent = 'Focus';
+          };
+          const make = () => {
+            if (dead) return;
+            player = new YT.Player('yt-ambience-player', {
+              width: '220', height: '124', videoId: VID,
+              playerVars: { autoplay: 1, controls: 1, loop: 1, playlist: VID, playsinline: 1, rel: 0, modestbranding: 1 },
+              events: {
+                onReady: (e) => { e.target.setVolume(45); e.target.playVideo(); },
+                onError: () => fallback('This YouTube video cannot be played here'),
+              },
+            });
+          };
+          if (window.YT && window.YT.Player) {
+            make();
+          } else {
+            const prev = window.onYouTubeIframeAPIReady;
+            window.onYouTubeIframeAPIReady = () => { if (prev) prev(); make(); };
+            if (!document.getElementById('yt-api')) {
+              const s = document.createElement('script');
+              s.id = 'yt-api';
+              s.src = 'https://www.youtube.com/iframe_api';
+              s.onerror = () => fallback('Could not reach YouTube');
+              document.head.appendChild(s);
+            }
+          }
+          state.ambienceCleanup = () => {
+            dead = true;
+            try { player && player.destroy(); } catch (e) {}
+            holder.innerHTML = '';
+            holder.style.display = 'none';
+          };
+        }
+
         function startAmbienceAudio(mode) {
           stopAmbienceAudio();
           if (mode === 'off') return;
+          if (mode === 'meditation') { startYouTubeAmbience(); return; }
           try {
             const ctx = state.audioContext || new (window.AudioContext || window.webkitAudioContext)();
             state.audioContext = ctx;
@@ -9472,12 +9525,14 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
         const btnProAmbience = document.getElementById('btn-pro-ambience');
         if (btnProAmbience) {
           btnProAmbience.addEventListener('click', () => {
-            const next = state.ambienceMode === 'off' ? 'rain' : state.ambienceMode === 'rain' ? 'focus' : 'off';
+            const order = ['off', 'meditation', 'rain', 'focus'];
+            const next = order[(order.indexOf(state.ambienceMode) + 1) % order.length];
             state.ambienceMode = next;
             startAmbienceAudio(next);
+            const names = { off: 'Off', meditation: 'Meditation', rain: 'Rain', focus: 'Focus' };
             const lbl = document.getElementById('pro-ambience-state');
-            if (lbl) lbl.textContent = next === 'off' ? 'Off' : next === 'rain' ? 'Rain' : 'Focus';
-            showToast(next === 'off' ? 'Focus Ambience stopped' : `Focus Ambience: ${next === 'rain' ? 'Soft Rain' : 'Deep Focus Tone'}`, 'info');
+            if (lbl) lbl.textContent = names[next];
+            showToast(next === 'off' ? 'Focus Ambience stopped' : `Focus Ambience: ${next === 'meditation' ? 'Soft Meditation Music' : next === 'rain' ? 'Soft Rain' : 'Deep Focus Tones'}`, 'info');
           });
         }
 
@@ -9508,33 +9563,71 @@ Click "Generate Executive Summary" above to synthesize key takeaways, decisions,
           });
         }
 
+        window.__pushAttendance = pushAttendanceToSheet;
+        function pushAttendanceToSheet(payload) {
+          const url = (window.CONFO_CONFIG || {}).sheetsWebhook;
+          if (!url) return false;
+          try {
+            fetch(url, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload) });
+            return true;
+          } catch (e) { return false; }
+        }
+
         function exportMeetingReport() {
+          const fmt = (t) => (t ? new Date(t).toLocaleString() : '');
+          const att = (state.attendance && state.attendance.length)
+            ? state.attendance
+            : [{ name: state.myName || 'You', email: '', role: state.myRole, joinedAt: Date.now() - (state.secondsElapsed || 0) * 1000, leftAt: null }];
+          const q = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+          const rows = [['Name', 'Email', 'Role', 'Joined', 'Left', 'Minutes present', 'Room']];
+          att.forEach((a) => {
+            const end = a.leftAt || Date.now();
+            rows.push([a.name, a.email || '', a.role, fmt(a.joinedAt), a.leftAt ? fmt(a.leftAt) : 'Still in meeting', Math.max(0, Math.round((end - a.joinedAt) / 60000)), state.roomId || '']);
+          });
           const lines = [
-            `1M Confo Enterprise Session Report`,
+            '1M Confo Session Report',
             `Room ID: ${state.roomId || 'N/A'}`,
             `Generated: ${new Date().toLocaleString()}`,
             `Elapsed Duration: ${formatClockTime(state.secondsElapsed)}`,
             '',
-            `PARTICIPANTS (${1 + state.remotePeers.size}):`,
-            `- ${state.myName || 'You'} (${state.myRole})`,
+            `ATTENDANCE (${att.length} entries):`,
           ];
-          state.remotePeers.forEach((p) => {
-            lines.push(`- ${p.name} (${p.role || 'participant'})`);
+          rows.slice(1).forEach((r) => lines.push(`- ${r[0]} (${r[2]}) joined ${r[3]} | left ${r[4]} | ${r[5]} min`));
+          lines.push('', 'POLLS:');
+          const polls = state.pollHistory || [];
+          if (!polls.length) lines.push('  (No polls run)');
+          polls.forEach((p, i) => {
+            const total = p.options.reduce((s, o) => s + (o.votes || 0), 0);
+            lines.push(`  #${i + 1} ${p.question} [${p.isActive ? 'LIVE' : 'CLOSED'}] - ${total} votes`);
+            p.options.forEach((o) => lines.push(`     - ${o.text}: ${o.votes || 0}`));
           });
           lines.push('', 'LIVE Q&A QUEUE:');
-          if (state.qaItems.length === 0) lines.push('  (No questions recorded)');
+          if (!state.qaItems.length) lines.push('  (No questions recorded)');
           state.qaItems.forEach((item, idx) => {
             const voteCount = item.upvoterPeerIds?.length ?? item.upvotes ?? 0;
-            lines.push(`  ${idx + 1}. [${item.answered ? 'ANSWERED' : 'OPEN'} | ${voteCount} votes] ${item.sender || item.author || 'Attendee'}: ${item.question}`);
+            lines.push(`  ${idx + 1}. [${item.answered ? 'ANSWERED' : 'OPEN'} | ${voteCount} votes] ${item.sender || item.author || 'Attendee'}: ${item.text || item.question || ''}`);
           });
           lines.push('', 'SHARED NOTES:', document.getElementById('meeting-notes-editor')?.value || '(Empty)');
+          lines.push('', 'CHAT TRANSCRIPT (public messages):');
+          const log = state.chatLog || [];
+          if (!log.length) lines.push('  (No public messages)');
+          log.forEach((m) => lines.push(`  [${m.time}] ${m.sender}: ${m.text}`));
 
-          const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(blob);
-          a.download = `1M Confo_Report_${state.roomId || 'session'}.txt`;
-          a.click();
-          showToast('Attendance & meeting report exported!', 'success');
+          const dl = (name, text, type) => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([text], { type }));
+            a.download = name;
+            a.click();
+          };
+          const sent = pushAttendanceToSheet({ action: 'replace', room: state.roomId, rows: rows.slice() });
+          dl(`1M-Confo_Report_${state.roomId || 'session'}.txt`, lines.join('\n'), 'text/plain;charset=utf-8');
+          setTimeout(() => dl(`1M-Confo_Attendance_${state.roomId || 'session'}.csv`, '\ufeff' + rows.map((r) => r.map(q).join(',')).join('\n'), 'text/csv;charset=utf-8'), 500);
+          if (sent) {
+            showToast('Attendance sent to your Google Sheet + report downloaded', 'success');
+          } else {
+            window.open('https://sheets.new', '_blank');
+            showToast('Report + attendance CSV downloaded. In the new Google Sheet use File → Import → Upload.', 'success');
+          }
         }
 
         const btnExportReport = document.getElementById('btn-pro-export-report');
